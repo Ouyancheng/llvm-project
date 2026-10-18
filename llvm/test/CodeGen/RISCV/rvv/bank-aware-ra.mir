@@ -1,0 +1,97 @@
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -run-pass=regalloc-bank-assign -verify-machineinstrs %s -o - | FileCheck %s
+# RUN: llc -mtriple=riscv64 -mattr=+v \
+# RUN:   -run-pass=regalloc-bank-assign -verify-machineinstrs %s -o - | FileCheck %s --check-prefix=OFF
+
+---
+name: vadd_different_banks
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    ; Two vector reads of one instruction must land in distinct banks.
+    ; CHECK-LABEL: name: vadd_different_banks
+    ; GPR is not banked.
+    ; CHECK: {{%[a-z0-9]+}}:gpr = COPY $x10
+    ; CHECK: %[[A:[a-z0-9]+]]:vrbank0 = IMPLICIT_DEF
+    ; CHECK: %[[B:[a-z0-9]+]]:vrbank1 = IMPLICIT_DEF
+    ; CHECK: {{%[a-z0-9]+}}:vrbank{{[0-3]}} = PseudoVADD_VV_M1 $noreg, %[[A]], %[[B]], $noreg /* vl */, 5 /* e32 */, 0 /* tu, mu */
+    ;
+    ; OFF-LABEL: name: vadd_different_banks
+    ; OFF-NOT: vrbank
+    ; OFF: {{%[a-z0-9]+}}:vr = IMPLICIT_DEF
+    ; OFF: {{%[a-z0-9]+}}:vr = IMPLICIT_DEF
+    %vl:gpr = COPY $x10
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %c:vr = PseudoVADD_VV_M1 $noreg, %a, %b, $noreg, 5, 0
+    $v8 = COPY %c
+    $x10 = COPY %vl
+    PseudoRET implicit $v8, implicit $x10
+...
+---
+name: vmacc_tied_dst_may_share_bank
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; Tied accumulator is 1R+1W of one register: it is not an RCG neighbor of
+    ; the two sources. The two sources still need distinct banks.
+    ; CHECK-LABEL: name: vmacc_tied_dst_may_share_bank
+    ; CHECK: %[[A:[a-z0-9]+]]:vrbank0 = IMPLICIT_DEF
+    ; CHECK: %[[B:[a-z0-9]+]]:vrbank1 = IMPLICIT_DEF
+    ; CHECK: PseudoVMACC_VV_M1 {{.*}} %[[A]], %[[B]], $noreg /* vl */, 5 /* e32 */, 0 /* tu, mu */
+    ;
+    ; OFF-LABEL: name: vmacc_tied_dst_may_share_bank
+    ; OFF-NOT: vrbank
+    %acc:vr = IMPLICIT_DEF
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %acc = PseudoVMACC_VV_M1 %acc, %a, %b, $noreg, 5, 0
+    $v8 = COPY %acc
+    PseudoRET implicit $v8
+...
+---
+name: k5_web_repaired_by_copy
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; K5 of co-issued reads is not 4-colorable; BankAssign must split a use
+    ; with COPY so the new live range can take another bank.
+    ; CHECK-LABEL: name: k5_web_repaired_by_copy
+    ; CHECK: {{%[a-z0-9]+}}:vrbank{{[0-3]}} = COPY %{{[a-z0-9]+}}
+    ; CHECK: PseudoVADD_VV_M1
+    ;
+    ; OFF-LABEL: name: k5_web_repaired_by_copy
+    ; OFF-NOT: vrbank
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %c:vr = IMPLICIT_DEF
+    %d:vr = IMPLICIT_DEF
+    %e:vr = IMPLICIT_DEF
+    %ab:vr = PseudoVADD_VV_M1 $noreg, %a, %b, $noreg, 5, 0
+    %ac:vr = PseudoVADD_VV_M1 $noreg, %a, %c, $noreg, 5, 0
+    %ad:vr = PseudoVADD_VV_M1 $noreg, %a, %d, $noreg, 5, 0
+    %ae:vr = PseudoVADD_VV_M1 $noreg, %a, %e, $noreg, 5, 0
+    %bc:vr = PseudoVADD_VV_M1 $noreg, %b, %c, $noreg, 5, 0
+    %bd:vr = PseudoVADD_VV_M1 $noreg, %b, %d, $noreg, 5, 0
+    %be:vr = PseudoVADD_VV_M1 $noreg, %b, %e, $noreg, 5, 0
+    %cd:vr = PseudoVADD_VV_M1 $noreg, %c, %d, $noreg, 5, 0
+    %ce:vr = PseudoVADD_VV_M1 $noreg, %c, %e, $noreg, 5, 0
+    %de:vr = PseudoVADD_VV_M1 $noreg, %d, %e, $noreg, 5, 0
+    $v8 = COPY %ab
+    $v9 = COPY %ac
+    $v10 = COPY %ad
+    $v11 = COPY %ae
+    $v12 = COPY %bc
+    $v13 = COPY %bd
+    $v14 = COPY %be
+    $v15 = COPY %cd
+    $v16 = COPY %ce
+    $v17 = COPY %de
+    $v18 = COPY %a
+    $v19 = COPY %b
+    $v20 = COPY %c
+    $v21 = COPY %d
+    $v22 = COPY %e
+    PseudoRET implicit $v8, implicit $v9, implicit $v10, implicit $v11, implicit $v12, implicit $v13, implicit $v14, implicit $v15, implicit $v16, implicit $v17, implicit $v18, implicit $v19, implicit $v20, implicit $v21, implicit $v22
+...

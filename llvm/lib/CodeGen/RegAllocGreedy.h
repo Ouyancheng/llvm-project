@@ -330,6 +330,12 @@ private:
 
   MCRegister tryAssign(const LiveInterval &, AllocationOrder &,
                        SmallVectorImpl<Register> &, const SmallVirtRegSet &);
+  /// True if PhysReg's bank collides with an already-assigned co-read of the
+  /// same instruction (same-port SRAM bank conflict).
+  bool hasBankConflict(const LiveInterval &VirtReg, MCRegister PhysReg) const;
+  /// Split a conflicting use into a new vreg that can take a free bank.
+  bool trySplitBankConflict(const LiveInterval &VirtReg,
+                            SmallVectorImpl<Register> &NewVRegs);
   MCRegister tryEvict(const LiveInterval &, AllocationOrder &,
                       SmallVectorImpl<Register> &, uint8_t,
                       const SmallVirtRegSet &);

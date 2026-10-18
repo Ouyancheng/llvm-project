@@ -18,6 +18,7 @@
 #include "SplitKit.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/IndexedMap.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -39,6 +40,7 @@
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
@@ -394,6 +396,10 @@ void RAGreedy::LRE_WillShrinkVirtReg(Register VirtReg) {
 
 void RAGreedy::LRE_DidCloneVirtReg(Register New, Register Old) {
   ExtraInfo->LRE_DidCloneVirtReg(New, Old);
+  // Split/remat/spill products of a banked vector range stay in that bank.
+  const TargetRegisterClass *OldRC = MRI->getRegClass(Old);
+  if (TRI->isBankedVectorRegClass(OldRC))
+    MRI->constrainRegClass(New, OldRC);
 }
 
 void RAGreedy::ExtraRegInfo::LRE_DidCloneVirtReg(Register New, Register Old) {
@@ -536,7 +542,8 @@ MCRegister RAGreedy::tryAssign(const LiveInterval &VirtReg,
   MCRegister PhysReg;
   for (auto I = Order.begin(), E = Order.end(); I != E && !PhysReg; ++I) {
     assert(*I);
-    if (!Matrix->checkInterference(VirtReg, *I)) {
+    if (!Matrix->checkInterference(VirtReg, *I) &&
+        !hasBankConflict(VirtReg, *I)) {
       if (I.isHint())
         return *I;
       else
@@ -580,7 +587,115 @@ MCRegister RAGreedy::tryAssign(const LiveInterval &VirtReg,
   LLVM_DEBUG(dbgs() << printReg(PhysReg, TRI) << " is available at cost "
                     << (unsigned)Cost << '\n');
   MCRegister CheapReg = tryEvict(VirtReg, Order, NewVRegs, Cost, FixedRegisters);
+  if (CheapReg && hasBankConflict(VirtReg, CheapReg))
+    CheapReg = MCRegister();
   return CheapReg ? CheapReg : PhysReg;
+}
+
+bool RAGreedy::hasBankConflict(const LiveInterval &VirtReg,
+                               MCRegister PhysReg) const {
+  const TargetRegisterClass *RC = MRI->getRegClass(VirtReg.reg());
+  unsigned NumBanks = TRI->getNumRegFileBanks(RC);
+  if (NumBanks <= 1)
+    return false;
+  unsigned Bank = TRI->getRegFileBank(PhysReg);
+  Register Reg = VirtReg.reg();
+  for (const MachineOperand &MO : MRI->reg_nodbg_operands(Reg)) {
+    if (!MO.isUse() || MO.isUndef())
+      continue;
+    const MachineInstr &MI = *MO.getParent();
+    if (MI.isCopy() || TII->isCopyInstr(MI) || MI.isDebugInstr())
+      continue;
+    unsigned TiedDef = 0;
+    if (MI.isRegTiedToDefOperand(MO.getOperandNo(), &TiedDef))
+      continue;
+    for (const MachineOperand &Other : MI.operands()) {
+      if (&Other == &MO || !Other.isReg() || !Other.isUse() || Other.isUndef())
+        continue;
+      Register OtherReg = Other.getReg();
+      unsigned OtherBank = ~0u;
+      if (OtherReg.isPhysical())
+        OtherBank = TRI->getRegFileBank(OtherReg.asMCReg());
+      else if (OtherReg.isVirtual() && VRM->hasPhys(OtherReg))
+        OtherBank = TRI->getRegFileBank(VRM->getPhys(OtherReg));
+      else
+        continue;
+      if (OtherBank == Bank)
+        return true;
+    }
+  }
+  return false;
+}
+
+bool RAGreedy::trySplitBankConflict(const LiveInterval &VirtReg,
+                                    SmallVectorImpl<Register> &NewVRegs) {
+  const TargetRegisterClass *RC = MRI->getRegClass(VirtReg.reg());
+  unsigned NumBanks = TRI->getNumRegFileBanks(RC);
+  if (NumBanks <= 1)
+    return false;
+  if (ExtraInfo->getStage(VirtReg) >= RS_Split2)
+    return false;
+
+  Register Reg = VirtReg.reg();
+  MachineOperand *SplitMO = nullptr;
+  unsigned FreeBank = ~0u;
+  unsigned NumUses = 0;
+  for (MachineOperand &MO : MRI->reg_nodbg_operands(Reg)) {
+    if (!MO.isUse() || MO.isUndef())
+      continue;
+    MachineInstr &MI = *MO.getParent();
+    if (MI.isCopy() || TII->isCopyInstr(MI) || MI.isDebugInstr())
+      continue;
+    unsigned TiedDef = 0;
+    if (MI.isRegTiedToDefOperand(MO.getOperandNo(), &TiedDef))
+      continue;
+    ++NumUses;
+    SmallBitVector UsedBanks(NumBanks);
+    for (const MachineOperand &Other : MI.operands()) {
+      if (&Other == &MO || !Other.isReg() || !Other.isUse() || Other.isUndef())
+        continue;
+      Register OtherReg = Other.getReg();
+      int B = -1;
+      if (OtherReg.isPhysical())
+        B = (int)TRI->getRegFileBank(OtherReg.asMCReg());
+      else if (OtherReg.isVirtual() && VRM->hasPhys(OtherReg))
+        B = (int)TRI->getRegFileBank(VRM->getPhys(OtherReg));
+      else if (OtherReg.isVirtual())
+        B = TRI->getExclusiveRegFileBank(MRI->getRegClass(OtherReg));
+      if (B >= 0 && (unsigned)B < NumBanks)
+        UsedBanks.set((unsigned)B);
+    }
+    int Free = UsedBanks.find_first_unset();
+    if (Free < 0)
+      continue;
+    int Ex = TRI->getExclusiveRegFileBank(RC);
+    if (Ex >= 0 && !UsedBanks.test((unsigned)Ex))
+      continue;
+    SplitMO = &MO;
+    FreeBank = (unsigned)Free;
+  }
+  if (!SplitMO || NumUses < 2)
+    return false;
+
+  const TargetRegisterClass *NewRC = TRI->getRegClassForBank(RC, FreeBank);
+  Register NewVReg = MRI->createVirtualRegister(NewRC);
+  MachineInstr &MI = *SplitMO->getParent();
+  bool WasKill = SplitMO->isKill();
+  MachineInstr *CopyMI =
+      BuildMI(*MI.getParent(), MI, MI.getDebugLoc(),
+              TII->get(TargetOpcode::COPY), NewVReg)
+          .addReg(Reg, getKillRegState(WasKill));
+  SplitMO->setReg(NewVReg);
+  SplitMO->setIsKill();
+  LIS->InsertMachineInstrInMaps(*CopyMI);
+  LIS->createAndComputeVirtRegInterval(NewVReg);
+  LIS->shrinkToUses(&LIS->getInterval(Reg));
+  ExtraInfo->setStage(NewVReg, RS_Assign);
+  NewVRegs.push_back(Reg);
+  NewVRegs.push_back(NewVReg);
+  LLVM_DEBUG(dbgs() << "Bank-conflict split " << printReg(Reg, TRI) << " -> "
+                    << printReg(NewVReg, TRI) << '\n');
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -2684,6 +2799,9 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
   if (!NewVRegs.empty())
     return MCRegister();
 
+  if (trySplitBankConflict(VirtReg, NewVRegs))
+    return MCRegister();
+
   LiveRangeStage Stage = ExtraInfo->getStage(VirtReg);
   LLVM_DEBUG(dbgs() << StageName[Stage] << " Cascade "
                     << ExtraInfo->getCascade(VirtReg.reg()) << '\n');
@@ -2695,15 +2813,17 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
     if (MCRegister PhysReg =
             tryEvict(VirtReg, Order, NewVRegs, CostPerUseLimit,
                      FixedRegisters)) {
-      Register Hint = MRI->getSimpleHint(VirtReg.reg());
-      // If VirtReg has a hint and that hint is broken record this
-      // virtual register as a recoloring candidate for broken hint.
-      // Indeed, since we evicted a variable in its neighborhood it is
-      // likely we can at least partially recolor some of the
-      // copy-related live-ranges.
-      if (Hint && Hint != PhysReg)
-        SetOfBrokenHints.insert(&VirtReg);
-      return PhysReg;
+      if (!hasBankConflict(VirtReg, PhysReg)) {
+        Register Hint = MRI->getSimpleHint(VirtReg.reg());
+        // If VirtReg has a hint and that hint is broken record this
+        // virtual register as a recoloring candidate for broken hint.
+        // Indeed, since we evicted a variable in its neighborhood it is
+        // likely we can at least partially recolor some of the
+        // copy-related live-ranges.
+        if (Hint && Hint != PhysReg)
+          SetOfBrokenHints.insert(&VirtReg);
+        return PhysReg;
+      }
     }
   }
 

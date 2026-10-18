@@ -802,6 +802,42 @@ public:
   /// Get the scale factor of spill weight for this register class.
   virtual float getSpillWeightScaleFactor(const TargetRegisterClass *RC) const;
 
+  /// Number of SRAM-style register-file banks for \p RC. The default of 1
+  /// means the class is not banked. Targets that model a multi-bank vector
+  /// register file should return the bank count for the affected classes.
+  virtual unsigned getNumRegFileBanks(const TargetRegisterClass *RC) const {
+    return 1;
+  }
+
+  /// Return true if \p RC is a vector class that participates in bank-aware
+  /// register allocation. Default: any class with more than one bank.
+  virtual bool isBankedVectorRegClass(const TargetRegisterClass *RC) const {
+    return getNumRegFileBanks(RC) > 1;
+  }
+
+  /// Bank index of physical register \p PhysReg, in
+  /// `[0, getNumRegFileBanks())`. Default 0.
+  virtual unsigned getRegFileBank(MCRegister PhysReg) const { return 0; }
+
+  /// Subclass of \p RC containing only physical registers of \p Bank.
+  /// Default returns \p RC unchanged.
+  virtual const TargetRegisterClass *
+  getRegClassForBank(const TargetRegisterClass *RC, unsigned Bank) const {
+    return RC;
+  }
+
+  /// If every physreg in \p RC belongs to the same bank, return that bank;
+  /// otherwise -1.
+  int getExclusiveRegFileBank(const TargetRegisterClass *RC) const {
+    if (!isBankedVectorRegClass(RC) || RC->getNumRegs() == 0)
+      return -1;
+    unsigned Bank = getRegFileBank(*RC->begin());
+    for (MCPhysReg R : *RC)
+      if (getRegFileBank(R) != Bank)
+        return -1;
+    return static_cast<int>(Bank);
+  }
+
   /// Returns the preferred order for allocating registers from this register
   /// class in MF. The raw order comes directly from the .td file and may
   /// include reserved registers that are not allocatable.

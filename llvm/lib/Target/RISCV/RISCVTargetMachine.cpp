@@ -14,6 +14,7 @@
 #include "RISCV.h"
 #include "RISCVMachineFunctionInfo.h"
 #include "RISCVMachineScheduler.h"
+#include "RISCVRegisterInfo.h"
 #include "RISCVTargetObjectFile.h"
 #include "RISCVTargetTransformInfo.h"
 #include "TargetInfo/RISCVTargetInfo.h"
@@ -454,6 +455,8 @@ bool RISCVPassConfig::addRegAssignAndRewriteFast() {
 }
 
 bool RISCVPassConfig::addRegAssignAndRewriteOptimized() {
+  if (isRISCVVRFBankRAEnabled())
+    addPass(createRegAllocBankAssignPass());
   addPass(createRVVRegAllocPass(true));
   addPass(createVirtRegRewriter(false));
   addPass(createRISCVInsertVSETVLIPass());
@@ -654,7 +657,6 @@ void RISCVPassConfig::addFastRegAlloc() {
   addPass(&InitUndefID);
   TargetPassConfig::addFastRegAlloc();
 }
-
 
 void RISCVPassConfig::addPostRegAlloc() {
   if (TM->getOptLevel() != CodeGenOptLevel::None &&

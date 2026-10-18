@@ -143,6 +143,16 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
   getLargestLegalSuperClass(const TargetRegisterClass *RC,
                             const MachineFunction &) const override;
 
+  unsigned getNumRegFileBanks(const TargetRegisterClass *RC) const override;
+  bool isBankedVectorRegClass(const TargetRegisterClass *RC) const override;
+  unsigned getRegFileBank(MCRegister PhysReg) const override;
+  const TargetRegisterClass *getRegClassForBank(const TargetRegisterClass *RC,
+                                                unsigned Bank) const override;
+  bool shouldCoalesce(MachineInstr *MI, const TargetRegisterClass *SrcRC,
+                      unsigned SubReg, const TargetRegisterClass *DstRC,
+                      unsigned DstSubReg, const TargetRegisterClass *NewRC,
+                      LiveIntervals &LIS) const override;
+
   void getOffsetOpcodes(const StackOffset &Offset,
                         SmallVectorImpl<uint64_t> &Ops) const override;
 
@@ -181,6 +191,9 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
            RISCV::FPR128RegClass.contains(Reg);
   }
 };
+
+/// True when -riscv-enable-vrf-bank-ra is set.
+LLVM_ABI bool isRISCVVRFBankRAEnabled();
 } // namespace llvm
 
 #endif

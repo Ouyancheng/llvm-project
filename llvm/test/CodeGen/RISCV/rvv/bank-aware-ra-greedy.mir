@@ -1,0 +1,20 @@
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -run-pass=regalloc-bank-assign,greedy,virtregrewriter \
+# RUN:   -verify-machineinstrs %s -o - | FileCheck %s
+
+---
+name: vadd_physregs_different_banks
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; After greedy, the two vector sources of vadd must have distinct
+    ; encodings modulo 4. Bank subclasses plus sequential allocation inside
+    ; each bank yield v8 (bank 0) and v9 (bank 1).
+    ; CHECK-LABEL: name: vadd_physregs_different_banks
+    ; CHECK: PseudoVADD_VV_M1 $noreg, {{.*}}$v8, {{.*}}$v9, $noreg /* vl */, 5 /* e32 */, 0 /* tu, mu */
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %c:vr = PseudoVADD_VV_M1 $noreg, %a, %b, $noreg, 5, 0
+    $v8 = COPY %c
+    PseudoRET implicit $v8
+...
