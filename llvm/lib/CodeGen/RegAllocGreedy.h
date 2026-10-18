@@ -147,6 +147,9 @@ public:
   const RegisterClassInfo &getRegClassInfo() const { return RegClassInfo; }
   const ExtraRegInfo &getExtraInfo() const { return *ExtraInfo; }
   size_t getQueueSize() const { return Queue.size(); }
+  /// True if PhysReg's bank collides with an already-assigned co-read/co-write
+  /// of the same instruction (same-port SRAM bank conflict).
+  bool hasBankConflict(const LiveInterval &VirtReg, MCRegister PhysReg) const;
   // end (interface to eviction advisers)
 
   // Interface to priority advisers
@@ -341,9 +344,16 @@ private:
   /// has a bank (physreg, assigned vreg, or exclusive subclass).
   bool collectCoIssuedBanks(const MachineOperand &MO,
                             SmallBitVector &UsedBanks) const;
-  /// True if PhysReg's bank collides with an already-assigned co-read/co-write
-  /// of the same instruction (same-port SRAM bank conflict).
-  bool hasBankConflict(const LiveInterval &VirtReg, MCRegister PhysReg) const;
+  /// Sum of live-interval sizes already assigned to \p Bank that overlap
+  /// \p VirtReg. Used to pick the least-loaded legal bank.
+  uint64_t getBankLoad(const LiveInterval &VirtReg, unsigned Bank) const;
+  /// True if \p LI can be reassigned to a physreg in a different bank than
+  /// \p FromReg without matrix interference or bank conflicts.
+  bool canReassignToOtherBank(const LiveInterval &LI, MCRegister FromReg) const;
+  /// Unassign a cheaper co-issued neighbor so \p VirtReg gets a free bank.
+  bool tryEvictBankNeighbor(const LiveInterval &VirtReg,
+                            SmallVectorImpl<Register> &NewVRegs,
+                            const SmallVirtRegSet &FixedRegisters);
   /// COPY-split a use when no single bank is legal at every use (online), or
   /// when a use conflicts with a committed exclusive bank (offline safety net).
   bool trySplitBankConflict(const LiveInterval &VirtReg,

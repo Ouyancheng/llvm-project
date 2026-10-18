@@ -86,6 +86,16 @@ STATISTIC(NumLocalSplits,  "Number of split local live ranges");
 STATISTIC(NumEvicted,      "Number of interferences evicted");
 STATISTIC(NumBankConflictSplits,
           "Number of COPY splits inserted to resolve SRAM bank conflicts");
+STATISTIC(NumBankNeighborEvicts,
+          "Number of co-issued vregs evicted to free a register-file bank");
+STATISTIC(NumBankLoadBalancePicks,
+          "Number of times the least-loaded legal bank beat first-fit");
+
+static cl::opt<bool> EnableBankGreedyOpts(
+    "regalloc-bank-greedy-opts", cl::Hidden, cl::init(true),
+    cl::desc("When allocating banked vector registers, pick the least-loaded "
+             "legal bank, skip bank-illegal eviction candidates, and evict a "
+             "cheaper co-issued neighbor before COPY-splitting"));
 
 static cl::opt<SplitEditor::ComplementSpillMode> SplitSpillMode(
     "split-spill-mode", cl::Hidden,
@@ -541,17 +551,51 @@ MCRegister RAGreedy::tryAssign(const LiveInterval &VirtReg,
                                AllocationOrder &Order,
                                SmallVectorImpl<Register> &NewVRegs,
                                const SmallVirtRegSet &FixedRegisters) {
+  const TargetRegisterClass *RC = MRI->getRegClass(VirtReg.reg());
+  unsigned NumBanks = TRI->getNumRegFileBanks(RC);
   MCRegister PhysReg;
-  for (auto I = Order.begin(), E = Order.end(); I != E && !PhysReg; ++I) {
+  MCRegister FirstFit;
+  SmallVector<MCRegister, 4> BestPerBank(NumBanks);
+  SmallVector<uint64_t, 4> LoadPerBank(NumBanks, ~0ull);
+
+  for (auto I = Order.begin(), E = Order.end(); I != E; ++I) {
     assert(*I);
-    if (!Matrix->checkInterference(VirtReg, *I) &&
-        !hasBankConflict(VirtReg, *I)) {
-      if (I.isHint())
-        return *I;
-      else
+    if (Matrix->checkInterference(VirtReg, *I) ||
+        hasBankConflict(VirtReg, *I))
+      continue;
+    if (I.isHint())
+      return *I;
+    if (!FirstFit.isValid()) {
+      FirstFit = *I;
+      if (NumBanks <= 1 || !EnableBankGreedyOpts) {
         PhysReg = *I;
+        break;
+      }
     }
+    unsigned B = TRI->getRegFileBank(*I);
+    if (B >= NumBanks || BestPerBank[B].isValid())
+      continue;
+    BestPerBank[B] = *I;
+    LoadPerBank[B] = getBankLoad(VirtReg, B);
   }
+
+  if (!PhysReg.isValid() && EnableBankGreedyOpts && NumBanks > 1) {
+    int Chosen = -1;
+    for (unsigned B = 0; B < NumBanks; ++B) {
+      if (!BestPerBank[B].isValid())
+        continue;
+      if (Chosen < 0 || LoadPerBank[B] < LoadPerBank[Chosen])
+        Chosen = (int)B;
+    }
+    if (Chosen >= 0) {
+      PhysReg = BestPerBank[Chosen];
+      if (FirstFit.isValid() && PhysReg != FirstFit)
+        ++NumBankLoadBalancePicks;
+    }
+  } else if (!PhysReg.isValid()) {
+    PhysReg = FirstFit;
+  }
+
   if (!PhysReg.isValid())
     return PhysReg;
 
@@ -564,7 +608,8 @@ MCRegister RAGreedy::tryAssign(const LiveInterval &VirtReg,
       MCRegister PhysHint = Hint.asMCReg();
       LLVM_DEBUG(dbgs() << "missed hint " << printReg(PhysHint, TRI) << '\n');
 
-      if (EvictAdvisor->canEvictHintInterference(VirtReg, PhysHint,
+      if (!hasBankConflict(VirtReg, PhysHint) &&
+          EvictAdvisor->canEvictHintInterference(VirtReg, PhysHint,
                                                  FixedRegisters)) {
         evictInterference(VirtReg, PhysHint, NewVRegs);
         return PhysHint;
@@ -647,6 +692,153 @@ bool RAGreedy::collectCoIssuedBanks(const MachineOperand &MO,
   return AllAssigned;
 }
 
+uint64_t RAGreedy::getBankLoad(const LiveInterval &VirtReg,
+                               unsigned Bank) const {
+  uint64_t Load = 0;
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+    Register Other = Register::index2VirtReg(I);
+    if (Other == VirtReg.reg() || !VRM->hasPhys(Other) ||
+        !LIS->hasInterval(Other))
+      continue;
+    const TargetRegisterClass *ORC = MRI->getRegClassOrNull(Other);
+    if (!ORC || !TRI->isBankedVectorRegClass(ORC))
+      continue;
+    if (TRI->getRegFileBank(VRM->getPhys(Other)) != Bank)
+      continue;
+    const LiveInterval &OL = LIS->getInterval(Other);
+    if (VirtReg.overlaps(OL))
+      Load += OL.getSize();
+  }
+  return Load;
+}
+
+bool RAGreedy::canReassignToOtherBank(const LiveInterval &LI,
+                                      MCRegister FromReg) const {
+  const TargetRegisterClass *RC = MRI->getRegClass(LI.reg());
+  unsigned NumBanks = TRI->getNumRegFileBanks(RC);
+  unsigned FromBank = NumBanks > 1 ? TRI->getRegFileBank(FromReg) : ~0u;
+  for (MCRegister Reg :
+       AllocationOrder::create(LI.reg(), *VRM, RegClassInfo, Matrix)) {
+    if (Reg == FromReg)
+      continue;
+    if (NumBanks > 1 && TRI->getRegFileBank(Reg) == FromBank)
+      continue;
+    if (hasBankConflict(LI, Reg) || Matrix->checkInterference(LI, Reg))
+      continue;
+    return true;
+  }
+  return false;
+}
+
+bool RAGreedy::tryEvictBankNeighbor(const LiveInterval &VirtReg,
+                                    SmallVectorImpl<Register> &NewVRegs,
+                                    const SmallVirtRegSet &FixedRegisters) {
+  if (!EnableBankGreedyOpts)
+    return false;
+  const TargetRegisterClass *RC = MRI->getRegClass(VirtReg.reg());
+  unsigned NumBanks = TRI->getNumRegFileBanks(RC);
+  if (NumBanks <= 1)
+    return false;
+
+  Register Reg = VirtReg.reg();
+  SmallBitVector GlobalLegal(NumBanks, true);
+  SmallSet<Register, 8> Neighbors;
+  for (const MachineOperand &MO : MRI->reg_nodbg_operands(Reg)) {
+    if (MO.isUndef() || (!MO.isUse() && !MO.isDef()))
+      continue;
+    const MachineInstr &MI = *MO.getParent();
+    if (MI.isCopy() || TII->isCopyInstr(MI) || MI.isDebugInstr())
+      continue;
+    if (MO.isUse()) {
+      unsigned TiedDef = 0;
+      if (MI.isRegTiedToDefOperand(MO.getOperandNo(), &TiedDef))
+        continue;
+    }
+    SmallBitVector UsedBanks(NumBanks);
+    collectCoIssuedBanks(MO, UsedBanks);
+    GlobalLegal.reset(UsedBanks);
+    const bool WantUse = MO.isUse();
+    for (const MachineOperand &Other : MI.operands()) {
+      if (&Other == &MO || !Other.isReg() || Other.isUndef() || !Other.getReg())
+        continue;
+      if (WantUse ? !Other.isUse() : !Other.isDef())
+        continue;
+      Register OtherReg = Other.getReg();
+      if (!OtherReg.isVirtual() || !VRM->hasPhys(OtherReg))
+        continue;
+      const TargetRegisterClass *ORC = MRI->getRegClassOrNull(OtherReg);
+      if (ORC && TRI->isBankedVectorRegClass(ORC))
+        Neighbors.insert(OtherReg);
+    }
+  }
+  if (GlobalLegal.any() || Neighbors.empty())
+    return false;
+
+  unsigned Cascade = ExtraInfo->getCascadeOrCurrentNext(Reg);
+  Register BestVictim;
+  float BestWeight = VirtReg.weight();
+  for (Register N : Neighbors) {
+    if (FixedRegisters.count(N) || !LIS->hasInterval(N))
+      continue;
+    const LiveInterval &NI = LIS->getInterval(N);
+    if (ExtraInfo->getStage(NI) == RS_Done || NI.weight() >= BestWeight)
+      continue;
+    unsigned IntfCascade = ExtraInfo->getCascade(N);
+    if (IntfCascade && IntfCascade >= Cascade)
+      continue;
+    if (!VRM->hasPhys(N))
+      continue;
+    MCRegister FromReg = VRM->getPhys(N);
+
+    SmallBitVector Legal(NumBanks, true);
+    for (const MachineOperand &MO : MRI->reg_nodbg_operands(Reg)) {
+      if (MO.isUndef() || (!MO.isUse() && !MO.isDef()))
+        continue;
+      const MachineInstr &MI = *MO.getParent();
+      if (MI.isCopy() || TII->isCopyInstr(MI) || MI.isDebugInstr())
+        continue;
+      if (MO.isUse()) {
+        unsigned TiedDef = 0;
+        if (MI.isRegTiedToDefOperand(MO.getOperandNo(), &TiedDef))
+          continue;
+      }
+      SmallBitVector UsedBanks(NumBanks);
+      const bool WantUse = MO.isUse();
+      for (const MachineOperand &Other : MI.operands()) {
+        if (&Other == &MO || !Other.isReg() || Other.isUndef() ||
+            !Other.getReg())
+          continue;
+        if (WantUse ? !Other.isUse() : !Other.isDef())
+          continue;
+        Register OtherReg = Other.getReg();
+        if (OtherReg == N)
+          continue;
+        int B = getCoIssuedOperandBank(OtherReg);
+        if (B >= 0 && (unsigned)B < NumBanks)
+          UsedBanks.set((unsigned)B);
+      }
+      Legal.reset(UsedBanks);
+    }
+    if (!Legal.any() || !canReassignToOtherBank(NI, FromReg))
+      continue;
+    BestVictim = N;
+    BestWeight = NI.weight();
+  }
+  if (!BestVictim)
+    return false;
+
+  unsigned NewCascade = ExtraInfo->getOrAssignNewCascade(Reg);
+  LiveInterval &VictimLI = LIS->getInterval(BestVictim);
+  LLVM_DEBUG(dbgs() << "evict bank neighbor " << printReg(BestVictim, TRI)
+                    << " to free a bank for " << printReg(Reg, TRI) << '\n');
+  Matrix->unassign(VictimLI);
+  ExtraInfo->setCascade(BestVictim, NewCascade);
+  NewVRegs.push_back(BestVictim);
+  ++NumBankNeighborEvicts;
+  ++NumEvicted;
+  return true;
+}
+
 bool RAGreedy::hasBankConflict(const LiveInterval &VirtReg,
                                MCRegister PhysReg) const {
   const TargetRegisterClass *RC = MRI->getRegClass(VirtReg.reg());
@@ -710,9 +902,20 @@ bool RAGreedy::trySplitBankConflict(const LiveInterval &VirtReg,
     // Offline: a committed bank that is still free here does not need a split.
     if (ExclusiveBank >= 0 && !UsedBanks.test((unsigned)ExclusiveBank))
       continue;
-    SplitMO = &MO;
-    FreeBank = (unsigned)Free;
-    SplitAllAssigned = AllAssigned;
+    bool Better = !SplitMO;
+    if (SplitMO && EnableBankGreedyOpts && MBFI) {
+      BlockFrequency NewFreq = MBFI->getBlockFreq(MI.getParent());
+      BlockFrequency OldFreq =
+          MBFI->getBlockFreq(SplitMO->getParent()->getParent());
+      Better = NewFreq < OldFreq;
+    } else if (SplitMO) {
+      Better = true; // last candidate, same as the original first-fit split
+    }
+    if (Better) {
+      SplitMO = &MO;
+      FreeBank = (unsigned)Free;
+      SplitAllAssigned = AllAssigned;
+    }
   }
 
   if (!SplitMO || NumUses < 2)
@@ -769,6 +972,8 @@ bool RegAllocEvictionAdvisor::canReassign(const LiveInterval &VirtReg,
   for (MCRegister Reg :
        AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix)) {
     if (Reg == FromReg)
+      continue;
+    if (RA.hasBankConflict(VirtReg, Reg))
       continue;
     // If no units have interference, reassignment is possible.
     if (none_of(TRI->regunits(Reg), HasRegUnitInterference)) {
@@ -2853,6 +3058,14 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
   // Non empty NewVRegs means VirtReg has been split.
   if (!NewVRegs.empty())
     return MCRegister();
+
+  if (tryEvictBankNeighbor(VirtReg, NewVRegs, FixedRegisters)) {
+    if (MCRegister P =
+            tryAssign(VirtReg, Order, NewVRegs, FixedRegisters))
+      return P;
+    NewVRegs.push_back(VirtReg.reg());
+    return MCRegister();
+  }
 
   if (trySplitBankConflict(VirtReg, NewVRegs))
     return MCRegister();

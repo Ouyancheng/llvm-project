@@ -357,6 +357,8 @@ MCRegister DefaultEvictionAdvisor::tryFindEvictionCandidate(
        ++I) {
     MCRegister PhysReg = *I;
     assert(PhysReg);
+    if (RA.hasBankConflict(VirtReg, PhysReg))
+      continue;
     if (!canAllocatePhysReg(CostPerUseLimit, PhysReg) ||
         !canEvictInterferenceBasedOnCost(VirtReg, PhysReg, false, BestCost,
                                          FixedRegisters))

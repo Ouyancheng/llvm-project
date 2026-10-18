@@ -1,0 +1,77 @@
+# Demonstrate greedy-style online bank coloring vs first-fit.
+#
+# Three overlapping VRBank0 ranges sit in v12/v16/v20, so bank 0 is loaded
+# but v8 (bank 0) is still free. First-fit packs the vadd sources onto v8/v9;
+# least-loaded prefers empty banks (v9/v10), leaving v8 for the dest hint.
+#
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -riscv-vrf-bank-ra-algorithm=online -regalloc-bank-greedy-opts=false \
+# RUN:   -run-pass=greedy,virtregrewriter -verify-machineinstrs %s -o - \
+# RUN:   | FileCheck %s --check-prefix=LINEAR
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -riscv-vrf-bank-ra-algorithm=online \
+# RUN:   -run-pass=greedy,virtregrewriter -verify-machineinstrs %s -o - \
+# RUN:   | FileCheck %s --check-prefix=GREEDY
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -riscv-vrf-bank-ra-algorithm=online -stats \
+# RUN:   -run-pass=greedy,virtregrewriter -verify-machineinstrs %s -o /dev/null \
+# RUN:   2>&1 | FileCheck %s --check-prefix=STATS
+#
+# STATS: Number of times the least-loaded legal bank beat first-fit
+
+---
+name: least_loaded_bank
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $v12, $v16, $v20
+    ; LINEAR-LABEL: name: least_loaded_bank
+    ; LINEAR: PseudoVADD_VV_M1 $noreg, {{.*}}$v8, {{.*}}$v9, $noreg /* vl */, 5 /* e32 */, 0 /* tu, mu */
+    ;
+    ; GREEDY-LABEL: name: least_loaded_bank
+    ; GREEDY: PseudoVADD_VV_M1 $noreg, {{.*}}$v9, {{.*}}$v10, $noreg /* vl */, 5 /* e32 */, 0 /* tu, mu */
+    %x:vrbank0 = COPY $v12
+    %y:vrbank0 = COPY $v16
+    %z:vrbank0 = COPY $v20
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %c:vr = PseudoVADD_VV_M1 $noreg, %a, %b, $noreg, 5, 0
+    $v8 = COPY %c
+    $v12 = COPY %x
+    $v16 = COPY %y
+    $v20 = COPY %z
+    PseudoRET implicit $v8, implicit $v12, implicit $v16, implicit $v20
+...
+---
+name: evict_cheap_coissued
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $v8, $v9, $v10
+    ; %a co-issues with banks 0/1/2 via physregs; %cheap is the fourth source.
+    ; Spill-weight order assigns %a first, so no neighbor eviction is needed.
+    ; LINEAR-LABEL: name: evict_cheap_coissued
+    ; LINEAR: PseudoVADD_VV_M1 {{.*}}$v15, $v8
+    ; LINEAR: PseudoVADD_VV_M1 {{.*}}$v15, $v9
+    ; LINEAR: PseudoVADD_VV_M1 {{.*}}$v15, $v10
+    ; LINEAR: PseudoVADD_VV_M1 {{.*}}$v15, {{.*}}$v16
+    ;
+    ; GREEDY-LABEL: name: evict_cheap_coissued
+    ; GREEDY: PseudoVADD_VV_M1 {{.*}}$v15, $v8
+    ; GREEDY: PseudoVADD_VV_M1 {{.*}}$v15, $v9
+    ; GREEDY: PseudoVADD_VV_M1 {{.*}}$v15, $v10
+    ; GREEDY: PseudoVADD_VV_M1 {{.*}}$v15, {{.*}}$v16
+    %a:vr = IMPLICIT_DEF
+    %cheap:vr = IMPLICIT_DEF
+    %t0:vr = PseudoVADD_VV_M1 $noreg, %a, $v8, $noreg, 5, 0
+    %t1:vr = PseudoVADD_VV_M1 $noreg, %a, $v9, $noreg, 5, 0
+    %t2:vr = PseudoVADD_VV_M1 $noreg, %a, $v10, $noreg, 5, 0
+    %t3:vr = PseudoVADD_VV_M1 $noreg, %a, %cheap, $noreg, 5, 0
+    $v11 = COPY %t0
+    $v12 = COPY %t1
+    $v13 = COPY %t2
+    $v14 = COPY %t3
+    $v15 = COPY %a
+    $v16 = COPY %cheap
+    PseudoRET implicit $v11, implicit $v12, implicit $v13, implicit $v14, implicit $v15, implicit $v16
+...
