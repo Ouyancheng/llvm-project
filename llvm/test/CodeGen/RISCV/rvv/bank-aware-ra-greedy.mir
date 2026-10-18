@@ -1,6 +1,10 @@
 # RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
 # RUN:   -run-pass=regalloc-bank-assign,greedy,virtregrewriter \
 # RUN:   -verify-machineinstrs %s -o - | FileCheck %s
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -riscv-vrf-bank-ra-algorithm=offline \
+# RUN:   -run-pass=regalloc-bank-assign,greedy,virtregrewriter \
+# RUN:   -verify-machineinstrs %s -o - | FileCheck %s
 
 ---
 name: vadd_physregs_different_banks

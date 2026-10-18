@@ -84,6 +84,8 @@ using namespace llvm;
 STATISTIC(NumGlobalSplits, "Number of split global live ranges");
 STATISTIC(NumLocalSplits,  "Number of split local live ranges");
 STATISTIC(NumEvicted,      "Number of interferences evicted");
+STATISTIC(NumBankConflictSplits,
+          "Number of COPY splits inserted to resolve SRAM bank conflicts");
 
 static cl::opt<SplitEditor::ComplementSpillMode> SplitSpillMode(
     "split-spill-mode", cl::Hidden,
@@ -592,6 +594,59 @@ MCRegister RAGreedy::tryAssign(const LiveInterval &VirtReg,
   return CheapReg ? CheapReg : PhysReg;
 }
 
+int RAGreedy::getCoIssuedOperandBank(Register Reg) const {
+  if (!Reg)
+    return -1;
+  const TargetRegisterClass *RC = nullptr;
+  if (Reg.isVirtual()) {
+    RC = MRI->getRegClassOrNull(Reg);
+    if (!RC || !TRI->isBankedVectorRegClass(RC))
+      return -1;
+    if (VRM->hasPhys(Reg))
+      return (int)TRI->getRegFileBank(VRM->getPhys(Reg));
+    return TRI->getExclusiveRegFileBank(RC);
+  }
+  if (!Reg.isPhysical())
+    return -1;
+  RC = TRI->getMinimalPhysRegClass(Reg);
+  if (!RC || !TRI->isBankedVectorRegClass(RC))
+    return -1;
+  return (int)TRI->getRegFileBank(Reg.asMCReg());
+}
+
+bool RAGreedy::collectCoIssuedBanks(const MachineOperand &MO,
+                                    SmallBitVector &UsedBanks) const {
+  const MachineInstr &MI = *MO.getParent();
+  const bool WantUse = MO.isUse();
+  bool AllAssigned = true;
+  for (const MachineOperand &Other : MI.operands()) {
+    if (&Other == &MO || !Other.isReg() || Other.isUndef() || !Other.getReg())
+      continue;
+    if (WantUse) {
+      if (!Other.isUse())
+        continue;
+      unsigned TiedDef = 0;
+      if (MI.isRegTiedToDefOperand(Other.getOperandNo(), &TiedDef))
+        continue;
+    } else if (!Other.isDef()) {
+      continue;
+    }
+    Register OtherReg = Other.getReg();
+    int B = getCoIssuedOperandBank(OtherReg);
+    if (B < 0) {
+      if (OtherReg.isVirtual()) {
+        const TargetRegisterClass *ORC = MRI->getRegClassOrNull(OtherReg);
+        if (ORC && TRI->isBankedVectorRegClass(ORC))
+          AllAssigned = false;
+      }
+      continue;
+    }
+    if ((unsigned)B < UsedBanks.size())
+      UsedBanks.set((unsigned)B);
+  }
+  return AllAssigned;
+}
+
 bool RAGreedy::hasBankConflict(const LiveInterval &VirtReg,
                                MCRegister PhysReg) const {
   const TargetRegisterClass *RC = MRI->getRegClass(VirtReg.reg());
@@ -601,28 +656,20 @@ bool RAGreedy::hasBankConflict(const LiveInterval &VirtReg,
   unsigned Bank = TRI->getRegFileBank(PhysReg);
   Register Reg = VirtReg.reg();
   for (const MachineOperand &MO : MRI->reg_nodbg_operands(Reg)) {
-    if (!MO.isUse() || MO.isUndef())
+    if (MO.isUndef() || (!MO.isUse() && !MO.isDef()))
       continue;
     const MachineInstr &MI = *MO.getParent();
     if (MI.isCopy() || TII->isCopyInstr(MI) || MI.isDebugInstr())
       continue;
-    unsigned TiedDef = 0;
-    if (MI.isRegTiedToDefOperand(MO.getOperandNo(), &TiedDef))
-      continue;
-    for (const MachineOperand &Other : MI.operands()) {
-      if (&Other == &MO || !Other.isReg() || !Other.isUse() || Other.isUndef())
+    if (MO.isUse()) {
+      unsigned TiedDef = 0;
+      if (MI.isRegTiedToDefOperand(MO.getOperandNo(), &TiedDef))
         continue;
-      Register OtherReg = Other.getReg();
-      unsigned OtherBank = ~0u;
-      if (OtherReg.isPhysical())
-        OtherBank = TRI->getRegFileBank(OtherReg.asMCReg());
-      else if (OtherReg.isVirtual() && VRM->hasPhys(OtherReg))
-        OtherBank = TRI->getRegFileBank(VRM->getPhys(OtherReg));
-      else
-        continue;
-      if (OtherBank == Bank)
-        return true;
     }
+    SmallBitVector UsedBanks(NumBanks);
+    collectCoIssuedBanks(MO, UsedBanks);
+    if (Bank < NumBanks && UsedBanks.test(Bank))
+      return true;
   }
   return false;
 }
@@ -637,9 +684,13 @@ bool RAGreedy::trySplitBankConflict(const LiveInterval &VirtReg,
     return false;
 
   Register Reg = VirtReg.reg();
+  int ExclusiveBank = TRI->getExclusiveRegFileBank(RC);
+  SmallBitVector GlobalLegal(NumBanks, true);
   MachineOperand *SplitMO = nullptr;
   unsigned FreeBank = ~0u;
+  bool SplitAllAssigned = false;
   unsigned NumUses = 0;
+
   for (MachineOperand &MO : MRI->reg_nodbg_operands(Reg)) {
     if (!MO.isUse() || MO.isUndef())
       continue;
@@ -651,34 +702,35 @@ bool RAGreedy::trySplitBankConflict(const LiveInterval &VirtReg,
       continue;
     ++NumUses;
     SmallBitVector UsedBanks(NumBanks);
-    for (const MachineOperand &Other : MI.operands()) {
-      if (&Other == &MO || !Other.isReg() || !Other.isUse() || Other.isUndef())
-        continue;
-      Register OtherReg = Other.getReg();
-      int B = -1;
-      if (OtherReg.isPhysical())
-        B = (int)TRI->getRegFileBank(OtherReg.asMCReg());
-      else if (OtherReg.isVirtual() && VRM->hasPhys(OtherReg))
-        B = (int)TRI->getRegFileBank(VRM->getPhys(OtherReg));
-      else if (OtherReg.isVirtual())
-        B = TRI->getExclusiveRegFileBank(MRI->getRegClass(OtherReg));
-      if (B >= 0 && (unsigned)B < NumBanks)
-        UsedBanks.set((unsigned)B);
-    }
+    bool AllAssigned = collectCoIssuedBanks(MO, UsedBanks);
+    GlobalLegal.reset(UsedBanks);
     int Free = UsedBanks.find_first_unset();
     if (Free < 0)
       continue;
-    int Ex = TRI->getExclusiveRegFileBank(RC);
-    if (Ex >= 0 && !UsedBanks.test((unsigned)Ex))
+    // Offline: a committed bank that is still free here does not need a split.
+    if (ExclusiveBank >= 0 && !UsedBanks.test((unsigned)ExclusiveBank))
       continue;
     SplitMO = &MO;
     FreeBank = (unsigned)Free;
+    SplitAllAssigned = AllAssigned;
   }
+
   if (!SplitMO || NumUses < 2)
     return false;
 
-  const TargetRegisterClass *NewRC = TRI->getRegClassForBank(RC, FreeBank);
+  // Online (no exclusive bank): only split when no single bank is legal at
+  // every use. Otherwise tryAssign failed due to ordinary interference.
+  if (ExclusiveBank < 0 && GlobalLegal.any())
+    return false;
+
+  // Constrain the split product when the parent already lives in one bank, or
+  // when every co-operand at the split site is already colored, so the new
+  // vreg cannot later collide with an unassigned neighbor of the same bank.
+  const TargetRegisterClass *NewRC = RC;
+  if (ExclusiveBank >= 0 || SplitAllAssigned)
+    NewRC = TRI->getRegClassForBank(RC, FreeBank);
   Register NewVReg = MRI->createVirtualRegister(NewRC);
+  VRM->grow();
   MachineInstr &MI = *SplitMO->getParent();
   bool WasKill = SplitMO->isKill();
   MachineInstr *CopyMI =
@@ -688,11 +740,14 @@ bool RAGreedy::trySplitBankConflict(const LiveInterval &VirtReg,
   SplitMO->setReg(NewVReg);
   SplitMO->setIsKill();
   LIS->InsertMachineInstrInMaps(*CopyMI);
-  LIS->createAndComputeVirtRegInterval(NewVReg);
+  LiveInterval &NewLI = LIS->createAndComputeVirtRegInterval(NewVReg);
   LIS->shrinkToUses(&LIS->getInterval(Reg));
+  VRAI->calculateSpillWeightAndHint(NewLI);
+  VRAI->calculateSpillWeightAndHint(LIS->getInterval(Reg));
   ExtraInfo->setStage(NewVReg, RS_Assign);
   NewVRegs.push_back(Reg);
   NewVRegs.push_back(NewVReg);
+  ++NumBankConflictSplits;
   LLVM_DEBUG(dbgs() << "Bank-conflict split " << printReg(Reg, TRI) << " -> "
                     << printReg(NewVReg, TRI) << '\n');
   return true;

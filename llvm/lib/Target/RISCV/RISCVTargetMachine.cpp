@@ -455,7 +455,7 @@ bool RISCVPassConfig::addRegAssignAndRewriteFast() {
 }
 
 bool RISCVPassConfig::addRegAssignAndRewriteOptimized() {
-  if (isRISCVVRFBankRAEnabled())
+  if (isRISCVVRFBankRAOffline())
     addPass(createRegAllocBankAssignPass());
   addPass(createRVVRegAllocPass(true));
   addPass(createVirtRegRewriter(false));

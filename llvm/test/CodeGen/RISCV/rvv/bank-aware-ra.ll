@@ -1,5 +1,11 @@
 ; RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
 ; RUN:   -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+; RUN:   -riscv-vrf-bank-ra-algorithm=offline -verify-machineinstrs < %s \
+; RUN:   | FileCheck %s
+; RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+; RUN:   -riscv-vrf-bank-ra-algorithm=online -verify-machineinstrs < %s \
+; RUN:   | FileCheck %s
 ; RUN: llc -mtriple=riscv64 -mattr=+v -verify-machineinstrs < %s | FileCheck %s
 
 ; Smoke test: enabling bank-aware RA must still produce a legal vadd.vv.

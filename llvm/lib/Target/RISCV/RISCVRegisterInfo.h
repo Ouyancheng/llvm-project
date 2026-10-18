@@ -194,6 +194,23 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
 
 /// True when -riscv-enable-vrf-bank-ra is set.
 LLVM_ABI bool isRISCVVRFBankRAEnabled();
+
+/// How bank conflicts are resolved when bank-aware RA is enabled.
+enum class RISCVVRFBankRAAlgorithm {
+  /// Precolor a 4-bank RCG (BankAssign), then allocate inside VRBank subclasses.
+  Offline,
+  /// No whole-function RCG: forbid conflicting banks in RAGreedy::tryAssign
+  /// and COPY-split a use when no single bank is legal at every use.
+  Online,
+};
+
+LLVM_ABI RISCVVRFBankRAAlgorithm getRISCVVRFBankRAAlgorithm();
+
+inline bool isRISCVVRFBankRAOffline() {
+  return isRISCVVRFBankRAEnabled() &&
+         getRISCVVRFBankRAAlgorithm() == RISCVVRFBankRAAlgorithm::Offline;
+}
+
 } // namespace llvm
 
 #endif

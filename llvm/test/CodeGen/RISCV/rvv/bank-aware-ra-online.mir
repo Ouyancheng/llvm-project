@@ -1,0 +1,109 @@
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -riscv-vrf-bank-ra-algorithm=online \
+# RUN:   -run-pass=greedy,virtregrewriter -verify-machineinstrs %s -o - \
+# RUN:   | FileCheck %s
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -riscv-vrf-bank-ra-algorithm=online \
+# RUN:   -run-pass=greedy -verify-machineinstrs %s -o - \
+# RUN:   | FileCheck %s --check-prefix=GREEDY
+# Online must not run BankAssign; classes stay VR until physreg assignment.
+# RUN: llc -mtriple=riscv64 -mattr=+v -riscv-enable-vrf-bank-ra \
+# RUN:   -riscv-vrf-bank-ra-algorithm=online \
+# RUN:   -run-pass=greedy -verify-machineinstrs %s -o - \
+# RUN:   | FileCheck %s --check-prefix=NOBANK
+
+---
+name: vadd_physregs_different_banks
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x10
+    ; Online: first source takes v8 (bank 0); second must skip bank 0, so v9.
+    ; GPR is allocated independently.
+    ; CHECK-LABEL: name: vadd_physregs_different_banks
+    ; CHECK: PseudoVADD_VV_M1 $noreg, {{.*}}$v8, {{.*}}$v9, $noreg /* vl */, 5 /* e32 */, 0 /* tu, mu */
+    ;
+    ; GREEDY-LABEL: name: vadd_physregs_different_banks
+    ; GREEDY: {{%[a-z0-9]+}}:gpr = COPY $x10
+    ; GREEDY: PseudoVADD_VV_M1
+    ;
+    ; NOBANK-LABEL: name: vadd_physregs_different_banks
+    ; NOBANK-NOT: vrbank
+    %vl:gpr = COPY $x10
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %c:vr = PseudoVADD_VV_M1 $noreg, %a, %b, $noreg, 5, 0
+    $v8 = COPY %c
+    $x10 = COPY %vl
+    PseudoRET implicit $v8, implicit $x10
+...
+---
+name: vmacc_tied_dst_may_share_bank
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; Tied accumulator is 1R+1W: dest v8 (bank 0) may share a source bank;
+    ; the two sources still land in distinct banks (v9, v10).
+    ; CHECK-LABEL: name: vmacc_tied_dst_may_share_bank
+    ; CHECK: PseudoVMACC_VV_M1 {{.*}}$v8, {{.*}}$v9, {{.*}}$v10, $noreg /* vl */, 5 /* e32 */, 0 /* tu, mu */
+    ;
+    ; GREEDY-LABEL: name: vmacc_tied_dst_may_share_bank
+    ; GREEDY: PseudoVMACC_VV_M1
+    ;
+    ; NOBANK-LABEL: name: vmacc_tied_dst_may_share_bank
+    ; NOBANK-NOT: vrbank
+    %acc:vr = IMPLICIT_DEF
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %acc = PseudoVMACC_VV_M1 %acc, %a, %b, $noreg, 5, 0
+    $v8 = COPY %acc
+    PseudoRET implicit $v8
+...
+---
+name: k5_web_repaired_by_copy
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    ; K5 of co-issued reads is not 4-colorable online either: the last
+    ; interval COPY-splits one use so that use can take another bank.
+    ; CHECK-LABEL: name: k5_web_repaired_by_copy
+    ; CHECK: {{.*}}$v{{[0-9]+}} = COPY {{.*}}$v{{[0-9]+}}
+    ; CHECK-NEXT: {{.*}}PseudoVADD_VV_M1
+    ;
+    ; GREEDY-LABEL: name: k5_web_repaired_by_copy
+    ; GREEDY: {{%[a-z0-9]+}}:vr{{[a-z0-9]*}} = COPY %{{[a-z0-9]+}}
+    ; GREEDY: PseudoVADD_VV_M1
+    ;
+    ; NOBANK-LABEL: name: k5_web_repaired_by_copy
+    %a:vr = IMPLICIT_DEF
+    %b:vr = IMPLICIT_DEF
+    %c:vr = IMPLICIT_DEF
+    %d:vr = IMPLICIT_DEF
+    %e:vr = IMPLICIT_DEF
+    %ab:vr = PseudoVADD_VV_M1 $noreg, %a, %b, $noreg, 5, 0
+    %ac:vr = PseudoVADD_VV_M1 $noreg, %a, %c, $noreg, 5, 0
+    %ad:vr = PseudoVADD_VV_M1 $noreg, %a, %d, $noreg, 5, 0
+    %ae:vr = PseudoVADD_VV_M1 $noreg, %a, %e, $noreg, 5, 0
+    %bc:vr = PseudoVADD_VV_M1 $noreg, %b, %c, $noreg, 5, 0
+    %bd:vr = PseudoVADD_VV_M1 $noreg, %b, %d, $noreg, 5, 0
+    %be:vr = PseudoVADD_VV_M1 $noreg, %b, %e, $noreg, 5, 0
+    %cd:vr = PseudoVADD_VV_M1 $noreg, %c, %d, $noreg, 5, 0
+    %ce:vr = PseudoVADD_VV_M1 $noreg, %c, %e, $noreg, 5, 0
+    %de:vr = PseudoVADD_VV_M1 $noreg, %d, %e, $noreg, 5, 0
+    $v8 = COPY %ab
+    $v9 = COPY %ac
+    $v10 = COPY %ad
+    $v11 = COPY %ae
+    $v12 = COPY %bc
+    $v13 = COPY %bd
+    $v14 = COPY %be
+    $v15 = COPY %cd
+    $v16 = COPY %ce
+    $v17 = COPY %de
+    $v18 = COPY %a
+    $v19 = COPY %b
+    $v20 = COPY %c
+    $v21 = COPY %d
+    $v22 = COPY %e
+    PseudoRET implicit $v8, implicit $v9, implicit $v10, implicit $v11, implicit $v12, implicit $v13, implicit $v14, implicit $v15, implicit $v16, implicit $v17, implicit $v18, implicit $v19, implicit $v20, implicit $v21, implicit $v22
+...

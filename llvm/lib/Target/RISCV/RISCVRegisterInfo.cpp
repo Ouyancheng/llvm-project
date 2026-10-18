@@ -42,9 +42,25 @@ static cl::opt<bool>
 
 static cl::opt<bool> EnableRISCVVRFBankRA(
     "riscv-enable-vrf-bank-ra", cl::Hidden, cl::init(false),
-    cl::desc("Assign LMUL=1 RVV registers to 4 VRF banks before RA"));
+    cl::desc("Enable 4-bank VRF-aware allocation for LMUL=1 RVV registers"));
+
+static cl::opt<RISCVVRFBankRAAlgorithm> RISCVVRFBankRAAlgorithmOpt(
+    "riscv-vrf-bank-ra-algorithm", cl::Hidden,
+    cl::init(RISCVVRFBankRAAlgorithm::Offline),
+    cl::desc("How to resolve intra-instruction VRF bank conflicts"),
+    cl::values(
+        clEnumValN(RISCVVRFBankRAAlgorithm::Offline, "offline",
+                   "Build and 4-color a whole-function RCG (BankAssign), then "
+                   "allocate inside VRBank subclasses"),
+        clEnumValN(RISCVVRFBankRAAlgorithm::Online, "online",
+                   "Skip BankAssign; resolve conflicts during RAGreedy from "
+                   "already-assigned co-issued operands")));
 
 bool llvm::isRISCVVRFBankRAEnabled() { return EnableRISCVVRFBankRA; }
+
+RISCVVRFBankRAAlgorithm llvm::getRISCVVRFBankRAAlgorithm() {
+  return RISCVVRFBankRAAlgorithmOpt;
+}
 
 static_assert(RISCV::X1 == RISCV::X0 + 1, "Register list not consecutive");
 static_assert(RISCV::X31 == RISCV::X0 + 31, "Register list not consecutive");

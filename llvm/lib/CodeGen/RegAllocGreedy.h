@@ -48,6 +48,8 @@ class LiveRegMatrix;
 class MachineBasicBlock;
 class MachineBlockFrequencyInfo;
 class MachineDominatorTree;
+class MachineOperand;
+class SmallBitVector;
 class MachineLoop;
 class MachineLoopInfo;
 class MachineOptimizationRemarkEmitter;
@@ -330,10 +332,20 @@ private:
 
   MCRegister tryAssign(const LiveInterval &, AllocationOrder &,
                        SmallVectorImpl<Register> &, const SmallVirtRegSet &);
-  /// True if PhysReg's bank collides with an already-assigned co-read of the
-  /// same instruction (same-port SRAM bank conflict).
+  /// Bank of a co-issued operand, or -1 if it does not constrain coloring
+  /// (not a banked vector, or an unassigned vreg with no exclusive bank).
+  int getCoIssuedOperandBank(Register Reg) const;
+  /// Fill UsedBanks with banks already taken by same-port co-operands of MO
+  /// (other reads if MO is a use, other writes if MO is a def). COPY is 1R+1W
+  /// and is skipped by the caller. Returns true if every co-operand already
+  /// has a bank (physreg, assigned vreg, or exclusive subclass).
+  bool collectCoIssuedBanks(const MachineOperand &MO,
+                            SmallBitVector &UsedBanks) const;
+  /// True if PhysReg's bank collides with an already-assigned co-read/co-write
+  /// of the same instruction (same-port SRAM bank conflict).
   bool hasBankConflict(const LiveInterval &VirtReg, MCRegister PhysReg) const;
-  /// Split a conflicting use into a new vreg that can take a free bank.
+  /// COPY-split a use when no single bank is legal at every use (online), or
+  /// when a use conflicts with a committed exclusive bank (offline safety net).
   bool trySplitBankConflict(const LiveInterval &VirtReg,
                             SmallVectorImpl<Register> &NewVRegs);
   MCRegister tryEvict(const LiveInterval &, AllocationOrder &,
