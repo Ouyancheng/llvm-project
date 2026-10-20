@@ -251,6 +251,10 @@ LLVM_ABI FunctionPass *createBasicRegisterAllocator(RegAllocFilterFunc F);
 LLVM_ABI FunctionPass *createGreedyRegisterAllocator();
 LLVM_ABI FunctionPass *createGreedyRegisterAllocator(RegAllocFilterFunc F);
 
+/// Constrain banked vector vregs to per-bank subclasses before greedy RA.
+LLVM_ABI FunctionPass *createRegAllocBankAssignPass();
+LLVM_ABI extern char &RegAllocBankAssignID;
+
 /// PBQPRegisterAllocation Pass - This pass implements the Partitioned Boolean
 /// Quadratic Prograaming (PBQP) based register allocator.
 ///

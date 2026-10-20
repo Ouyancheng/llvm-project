@@ -143,6 +143,16 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
   getLargestLegalSuperClass(const TargetRegisterClass *RC,
                             const MachineFunction &) const override;
 
+  unsigned getNumRegFileBanks(const TargetRegisterClass *RC) const override;
+  bool isBankedVectorRegClass(const TargetRegisterClass *RC) const override;
+  unsigned getRegFileBank(MCRegister PhysReg) const override;
+  const TargetRegisterClass *getRegClassForBank(const TargetRegisterClass *RC,
+                                                unsigned Bank) const override;
+  bool shouldCoalesce(MachineInstr *MI, const TargetRegisterClass *SrcRC,
+                      unsigned SubReg, const TargetRegisterClass *DstRC,
+                      unsigned DstSubReg, const TargetRegisterClass *NewRC,
+                      LiveIntervals &LIS) const override;
+
   void getOffsetOpcodes(const StackOffset &Offset,
                         SmallVectorImpl<uint64_t> &Ops) const override;
 
@@ -185,6 +195,26 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
            RISCV::FPR128RegClass.contains(Reg);
   }
 };
+
+/// True when -riscv-enable-vrf-bank-ra is set.
+LLVM_ABI bool isRISCVVRFBankRAEnabled();
+
+/// How bank conflicts are resolved when bank-aware RA is enabled.
+enum class RISCVVRFBankRAAlgorithm {
+  /// Precolor a 4-bank RCG (BankAssign), then allocate inside VRBank subclasses.
+  Offline,
+  /// No whole-function RCG: forbid conflicting banks in RAGreedy::tryAssign
+  /// and COPY-split a use when no single bank is legal at every use.
+  Online,
+};
+
+LLVM_ABI RISCVVRFBankRAAlgorithm getRISCVVRFBankRAAlgorithm();
+
+inline bool isRISCVVRFBankRAOffline() {
+  return isRISCVVRFBankRAEnabled() &&
+         getRISCVVRFBankRAAlgorithm() == RISCVVRFBankRAAlgorithm::Offline;
+}
+
 } // namespace llvm
 
 #endif

@@ -15,10 +15,13 @@
 #include "RISCVSubtarget.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -28,6 +31,28 @@
 #include "RISCVGenRegisterInfo.inc"
 
 using namespace llvm;
+
+static cl::opt<bool> EnableRISCVVRFBankRA(
+    "riscv-enable-vrf-bank-ra", cl::Hidden, cl::init(false),
+    cl::desc("Enable 4-bank VRF-aware allocation for LMUL=1 RVV registers"));
+
+static cl::opt<RISCVVRFBankRAAlgorithm> RISCVVRFBankRAAlgorithmOpt(
+    "riscv-vrf-bank-ra-algorithm", cl::Hidden,
+    cl::init(RISCVVRFBankRAAlgorithm::Offline),
+    cl::desc("How to resolve intra-instruction VRF bank conflicts"),
+    cl::values(
+        clEnumValN(RISCVVRFBankRAAlgorithm::Offline, "offline",
+                   "Build and 4-color a whole-function RCG (BankAssign), then "
+                   "allocate inside VRBank subclasses"),
+        clEnumValN(RISCVVRFBankRAAlgorithm::Online, "online",
+                   "Skip BankAssign; resolve conflicts during RAGreedy from "
+                   "already-assigned co-issued operands")));
+
+bool llvm::isRISCVVRFBankRAEnabled() { return EnableRISCVVRFBankRA; }
+
+RISCVVRFBankRAAlgorithm llvm::getRISCVVRFBankRAAlgorithm() {
+  return RISCVVRFBankRAAlgorithmOpt;
+}
 
 static_assert(RISCV::X1 == RISCV::X0 + 1, "Register list not consecutive");
 static_assert(RISCV::X31 == RISCV::X0 + 31, "Register list not consecutive");
@@ -938,7 +963,107 @@ RISCVRegisterInfo::getLargestLegalSuperClass(const TargetRegisterClass *RC,
     return &RISCV::VRM4RegClass;
   if (RC == &RISCV::VRM8NoV0RegClass)
     return &RISCV::VRM8RegClass;
+  // Do not promote VRBankN / VRBank0NoV0 back to VR; that would undo
+  // bank-aware register allocation.
   return RC;
+}
+
+bool RISCVRegisterInfo::isBankedVectorRegClass(
+    const TargetRegisterClass *RC) const {
+  if (!EnableRISCVVRFBankRA)
+    return false;
+  if (!isVRRegClass(RC) || RC == &RISCV::VMV0RegClass)
+    return false;
+  return RISCVRI::getLMul(RC->TSFlags) == RISCVVType::LMUL_1;
+}
+
+unsigned RISCVRegisterInfo::getNumRegFileBanks(
+    const TargetRegisterClass *RC) const {
+  return isBankedVectorRegClass(RC) ? 4 : 1;
+}
+
+unsigned RISCVRegisterInfo::getRegFileBank(MCRegister PhysReg) const {
+  if (RISCV::VRRegClass.contains(PhysReg))
+    return getEncodingValue(PhysReg) % 4;
+  return 0;
+}
+
+const TargetRegisterClass *
+RISCVRegisterInfo::getRegClassForBank(const TargetRegisterClass *RC,
+                                      unsigned Bank) const {
+  assert(Bank < 4 && "invalid VRF bank");
+  const bool NoV0 = !RC->contains(RISCV::V0);
+  switch (Bank) {
+  case 0:
+    return NoV0 ? &RISCV::VRBank0NoV0RegClass : &RISCV::VRBank0RegClass;
+  case 1:
+    return &RISCV::VRBank1RegClass;
+  case 2:
+    return &RISCV::VRBank2RegClass;
+  case 3:
+    return &RISCV::VRBank3RegClass;
+  default:
+    llvm_unreachable("invalid VRF bank");
+  }
+}
+
+bool RISCVRegisterInfo::shouldCoalesce(
+    MachineInstr *MI, const TargetRegisterClass *SrcRC, unsigned SubReg,
+    const TargetRegisterClass *DstRC, unsigned DstSubReg,
+    const TargetRegisterClass *NewRC, LiveIntervals &LIS) const {
+  if (!EnableRISCVVRFBankRA)
+    return true;
+  if (!isBankedVectorRegClass(SrcRC) && !isBankedVectorRegClass(DstRC) &&
+      !isBankedVectorRegClass(NewRC))
+    return true;
+
+  int SrcBank = getExclusiveRegFileBank(SrcRC);
+  int DstBank = getExclusiveRegFileBank(DstRC);
+  if (SrcBank >= 0 && DstBank >= 0 && SrcBank != DstBank)
+    return false;
+
+  if (!MI->isCopy() || MI->getNumExplicitOperands() < 2)
+    return true;
+
+  Register DstReg = MI->getOperand(0).getReg();
+  Register SrcReg = MI->getOperand(1).getReg();
+  if (!DstReg.isVirtual() || !SrcReg.isVirtual())
+    return true;
+
+  MachineRegisterInfo &MRI = MI->getMF()->getRegInfo();
+  auto CollectNeighbors = [&](Register R) {
+    SmallSet<Register, 8> Neighbors;
+    for (const MachineOperand &MO : MRI.reg_nodbg_operands(R)) {
+      if (!MO.isUse() || MO.isUndef())
+        continue;
+      const MachineInstr &UseMI = *MO.getParent();
+      if (UseMI.isCopy() || UseMI.isDebugInstr())
+        continue;
+      unsigned TiedDef = 0;
+      if (UseMI.isRegTiedToDefOperand(MO.getOperandNo(), &TiedDef))
+        continue;
+      for (const MachineOperand &Other : UseMI.operands()) {
+        if (!Other.isReg() || !Other.isUse() || Other.isUndef())
+          continue;
+        Register OtherReg = Other.getReg();
+        if (!OtherReg.isVirtual() || OtherReg == R)
+          continue;
+        const TargetRegisterClass *ORC = MRI.getRegClassOrNull(OtherReg);
+        if (ORC && isBankedVectorRegClass(ORC))
+          Neighbors.insert(OtherReg);
+      }
+    }
+    return Neighbors;
+  };
+
+  SmallSet<Register, 8> Neighbors = CollectNeighbors(SrcReg);
+  SmallSet<Register, 8> DstNeighbors = CollectNeighbors(DstReg);
+  Neighbors.insert(DstNeighbors.begin(), DstNeighbors.end());
+  Neighbors.erase(SrcReg);
+  Neighbors.erase(DstReg);
+  // Merging two webs that together have 4+ co-read partners can make the
+  // bank-conflict graph fail to 4-color. Keep them split.
+  return Neighbors.size() < 4;
 }
 
 void RISCVRegisterInfo::getOffsetOpcodes(const StackOffset &Offset,

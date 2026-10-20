@@ -898,6 +898,19 @@ def VR : VReg<!listconcat(VM1VTs, VMaskVTs),
 
 def VRNoV0 : VReg<!listconcat(VM1VTs, VMaskVTs), (sub VR, V0), 1>;
 
+// Stride-4 SRAM-style banks of VR (encoding % 4). Used by bank-aware RA to
+// constrain LMUL=1 vector vregs so co-issued reads use distinct banks.
+// Allocation order matches VR: argument regs (v8+) first, v0 last.
+def VRBank0 : VReg<!listconcat(VM1VTs, VMaskVTs),
+                   (add V8, V12, V16, V20, V24, V28, V4, V0), 1>;
+def VRBank1 : VReg<!listconcat(VM1VTs, VMaskVTs),
+                   (add V9, V13, V17, V21, V25, V29, V5, V1), 1>;
+def VRBank2 : VReg<!listconcat(VM1VTs, VMaskVTs),
+                   (add V10, V14, V18, V22, V26, V30, V6, V2), 1>;
+def VRBank3 : VReg<!listconcat(VM1VTs, VMaskVTs),
+                   (add V11, V15, V19, V23, V27, V31, V7, V3), 1>;
+def VRBank0NoV0 : VReg<!listconcat(VM1VTs, VMaskVTs), (sub VRBank0, V0), 1>;
+
 def VRM2 : VReg<VM2VTs, (add (sequence "V%uM2", 8, 31, 2),
                              (sequence "V%uM2", 6, 0, 2)), 2> {
   let DecoderMethod = "DecodeVectorRegisterClass<RISCV::VRM2RegClassID, 32, 2>";

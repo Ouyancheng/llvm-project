@@ -205,6 +205,7 @@ add_llvm_component_library(LLVMCodeGen
   RegAllocBasic.cpp
   RegAllocEvictionAdvisor.cpp
   RegAllocFast.cpp
+  RegAllocBankAssign.cpp
   RegAllocGreedy.cpp
   RegAllocPBQP.cpp
   RegAllocPriorityAdvisor.cpp

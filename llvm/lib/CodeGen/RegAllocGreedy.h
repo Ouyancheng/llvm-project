@@ -48,6 +48,8 @@ class LiveRegMatrix;
 class MachineBasicBlock;
 class MachineBlockFrequencyInfo;
 class MachineDominatorTree;
+class MachineOperand;
+class SmallBitVector;
 class MachineLoop;
 class MachineLoopInfo;
 class MachineOptimizationRemarkEmitter;
@@ -145,6 +147,9 @@ public:
   const RegisterClassInfo &getRegClassInfo() const { return RegClassInfo; }
   const ExtraRegInfo &getExtraInfo() const { return *ExtraInfo; }
   size_t getQueueSize() const { return Queue.size(); }
+  /// True if PhysReg's bank collides with an already-assigned co-read/co-write
+  /// of the same instruction (same-port SRAM bank conflict).
+  bool hasBankConflict(const LiveInterval &VirtReg, MCRegister PhysReg) const;
   // end (interface to eviction advisers)
 
   // Interface to priority advisers
@@ -330,6 +335,29 @@ private:
 
   MCRegister tryAssign(const LiveInterval &, AllocationOrder &,
                        SmallVectorImpl<Register> &, const SmallVirtRegSet &);
+  /// Bank of a co-issued operand, or -1 if it does not constrain coloring
+  /// (not a banked vector, or an unassigned vreg with no exclusive bank).
+  int getCoIssuedOperandBank(Register Reg) const;
+  /// Fill UsedBanks with banks already taken by same-port co-operands of MO
+  /// (other reads if MO is a use, other writes if MO is a def). COPY is 1R+1W
+  /// and is skipped by the caller. Returns true if every co-operand already
+  /// has a bank (physreg, assigned vreg, or exclusive subclass).
+  bool collectCoIssuedBanks(const MachineOperand &MO,
+                            SmallBitVector &UsedBanks) const;
+  /// Sum of live-interval sizes already assigned to \p Bank that overlap
+  /// \p VirtReg. Used to pick the least-loaded legal bank.
+  uint64_t getBankLoad(const LiveInterval &VirtReg, unsigned Bank) const;
+  /// True if \p LI can be reassigned to a physreg in a different bank than
+  /// \p FromReg without matrix interference or bank conflicts.
+  bool canReassignToOtherBank(const LiveInterval &LI, MCRegister FromReg) const;
+  /// Unassign a cheaper co-issued neighbor so \p VirtReg gets a free bank.
+  bool tryEvictBankNeighbor(const LiveInterval &VirtReg,
+                            SmallVectorImpl<Register> &NewVRegs,
+                            const SmallVirtRegSet &FixedRegisters);
+  /// COPY-split a use when no single bank is legal at every use (online), or
+  /// when a use conflicts with a committed exclusive bank (offline safety net).
+  bool trySplitBankConflict(const LiveInterval &VirtReg,
+                            SmallVectorImpl<Register> &NewVRegs);
   MCRegister tryEvict(const LiveInterval &, AllocationOrder &,
                       SmallVectorImpl<Register> &, uint8_t,
                       const SmallVirtRegSet &);
